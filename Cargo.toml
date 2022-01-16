@@ -1,0 +1,15 @@
+[package]
+name = "hostel"
+version = "0.1.0"
+authors = ["Denbeigh Stevens <denbeigh@denbeighstevens.com>"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+bollard = "0.11"
+futures = "0.3"
+thiserror = "1.0"
+thrussh = "0.32"
+thrussh-keys = "0.20"
+tokio = { version = "1", features = ["full"] }
