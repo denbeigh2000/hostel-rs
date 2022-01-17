@@ -2,10 +2,7 @@ use std::convert::Infallible;
 use std::marker::PhantomData;
 
 use bb8_redis::bb8::{Pool, PooledConnection};
-use bb8_redis::redis::aio::ConnectionLike;
-use bb8_redis::redis::{
-    self, AsyncCommands, Cmd, FromRedisValue, Pipeline, RedisResult, ToRedisArgs, Value,
-};
+use bb8_redis::redis::{self, FromRedisValue, RedisResult, ToRedisArgs, Value};
 use bb8_redis::RedisConnectionManager;
 use futures::Future;
 
@@ -48,7 +45,7 @@ impl<V> OptionalCountAndResource<V> {
     }
 }
 
-pub struct CountAndResource<V>(usize, Resource<V>);
+pub struct CountAndResource<V>(pub usize, pub Resource<V>);
 
 impl<V> ToRedisArgs for Resource<V>
 where
@@ -95,9 +92,21 @@ where
     pool: Pool<RedisConnectionManager>,
 }
 
+impl<K, V> ResourcePool<K, V>
+where
+    K: Key,
+    V: AsRef<str> + From<String>,
+{
+    pub fn new(pool: Pool<RedisConnectionManager>) -> Self {
+        let _k = PhantomData::default();
+        let _v = PhantomData::default();
+        Self { _k, _v, pool }
+    }
+}
+
 pub trait Key {
     fn category_key(&'_ self) -> &'_ str;
-    fn key(&self) -> String;
+    fn key(&'_ self) -> &'_ str;
 }
 
 impl<K, V> ResourcePool<K, V>
