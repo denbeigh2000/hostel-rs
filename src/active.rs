@@ -126,6 +126,16 @@ where
         format!("{}:id:{}", key.category_key(), key.key())
     }
 
+    pub async fn set_id(&self, key: &K, v: &V) -> Result<(), Infallible> {
+        let res_key = self.resource_id_key(key);
+        let mut conn = self.get_conn().await.unwrap();
+        let mut cmd = redis::Cmd::new();
+        cmd.arg("SET").arg(&res_key).arg(v.as_ref());
+        let _: () = cmd.query_async(&mut *conn).await.unwrap();
+
+        Ok(())
+    }
+
     pub async fn join(&self, key: &K) -> Result<CountAndResource<V>, Infallible> {
         let count_key = self.count_key(key);
         let res_key = self.resource_id_key(key);
@@ -203,11 +213,11 @@ async fn join_txn<V: From<String>>(
     mut conn: RedisConn<'_>,
     args: (String, String),
 ) -> RedisResult<(RedisConn<'_>, Tx<Option<CountAndResource<V>>>)> {
-    let mut pl = redis::pipe();
-    let (rk, ck) = args;
+    let mut cmd = redis::Cmd::new();
+    let (ck, rk) = args;
 
-    pl.cmd("GET").arg(&rk).cmd("GET").arg(&ck);
-    let data: OptionalCountAndResource<V> = pl.query_async(&mut *conn).await.unwrap();
+    cmd.arg("MGET").arg(&ck).arg(&rk);
+    let data: OptionalCountAndResource<V> = cmd.query_async(&mut *conn).await.unwrap();
     if let Some(r) = data.transpose() {
         let n = r.0 + 1;
         let mut pl = redis::pipe();
@@ -245,9 +255,9 @@ async fn leave_txn<'a, 'b, V: AsRef<str> + From<String>>(
 ) -> RedisResult<(RedisConn<'a>, Tx<PoolState>)> {
     let (count_key, res_key, _resource) = args;
 
-    let mut pl = redis::pipe();
-    pl.cmd("GET").arg(&count_key).cmd("GET").arg(&res_key);
-    let data: OptionalCountAndResource<V> = pl.query_async(&mut *conn).await.unwrap();
+    let mut cmd = redis::Cmd::new();
+    cmd.arg("MGET").arg(&count_key).arg(&res_key);
+    let data: OptionalCountAndResource<V> = cmd.query_async(&mut *conn).await.unwrap();
     let mut pl = redis::pipe();
     let state = match data.transpose() {
         None | Some(CountAndResource(0, _)) | Some(CountAndResource(1, _)) => {

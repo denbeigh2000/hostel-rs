@@ -14,10 +14,9 @@ use thiserror::Error;
 use thrussh::server::{Auth, Handler, Response, Server, Session};
 use thrussh::{ChannelId, CryptoVec};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::sync::mpsc;
 
 use crate::active::{CountAndResource, Key, Resource, ResourcePool};
-
-static DEST_CONTAINER: &str = "a0b95114e3b8";
 
 type LogStream = Pin<Box<dyn Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>;
 type ContainerSink = Pin<Box<dyn AsyncWrite + Send>>;
@@ -43,12 +42,10 @@ impl SSHSession {
             .map(|p| vec![format!("SHELL={}", p.term)])
     }
 
-    pub fn set_connected(&mut self, exec_id: String, stdin: ContainerSink) {
+    pub fn set_connected(&mut self, exec_id: String) {
         match self.state {
-            ConnectionState::Connected(_, _) => panic!("already connected"),
-            ConnectionState::NotConnected => {
-                self.state = ConnectionState::Connected(exec_id, stdin)
-            }
+            ConnectionState::Connected(_) => panic!("already connected"),
+            ConnectionState::NotConnected => self.state = ConnectionState::Connected(exec_id),
         }
     }
 }
@@ -64,7 +61,7 @@ impl Default for SSHSession {
 
 pub enum ConnectionState {
     NotConnected,
-    Connected(String, ContainerSink),
+    Connected(String),
 }
 
 #[derive(Debug)]
@@ -140,6 +137,7 @@ impl Key for Username {
     }
 }
 
+#[derive(Debug)]
 pub struct ContainerId(String);
 
 impl From<String> for ContainerId {
@@ -158,7 +156,8 @@ pub struct DockerHandler {
     client: Arc<Docker>,
     active_resources: Arc<ResourcePool<Username, ContainerId>>,
     sessions: HashMap<ChannelId, SSHSession>,
-    username: Option<String>,
+    username: Option<Username>,
+    data_tx: mpsc::Sender<InputItem>,
 }
 
 impl DockerHandler {
@@ -167,11 +166,15 @@ impl DockerHandler {
         active_resources: Arc<ResourcePool<Username, ContainerId>>,
     ) -> Self {
         let sessions = HashMap::new();
+        let (data_tx, data_rx) = mpsc::channel(24);
+        tokio::spawn(handle_input(data_rx));
+
         Self {
             client,
             sessions,
             active_resources,
             username: None,
+            data_tx,
         }
     }
 }
@@ -211,7 +214,7 @@ impl Handler for DockerHandler {
 
     fn auth_none(mut self, user: &str) -> Self::FutureAuth {
         eprintln!("user {} connecting", user);
-        self.username = Some(user.to_string());
+        self.username = Some(Username(user.to_string()));
         self.finished_auth(match user {
             "denbeigh" => Auth::Accept,
             _ => Auth::Reject,
@@ -225,7 +228,7 @@ impl Handler for DockerHandler {
         _response: Option<Response<'_>>,
     ) -> Self::FutureAuth {
         eprintln!("user {} connecting", user);
-        self.username = Some(user.to_string());
+        self.username = Some(Username(user.to_string()));
         self.finished_auth(match user {
             "denbeigh" => Auth::Accept,
             _ => Auth::Reject,
@@ -326,21 +329,30 @@ async fn handle_exec(
     eprintln!("eof sent");
 }
 
-async fn handle_data(
-    mut h: DockerHandler,
-    channel: ChannelId,
-    data: Vec<u8>,
-    session: Session,
-) -> Result<(DockerHandler, Session), HandlerError> {
-    let ssh_session = h
-        .sessions
-        .get_mut(&channel)
-        .expect("data for uninitialised channel?");
-    if let ConnectionState::Connected(_, input) = &mut ssh_session.state {
-        input.write_all(&data).await.unwrap();
-    }
+enum InputItem {
+    Channel(ChannelId, ContainerSink),
+    Message(ChannelId, Vec<u8>),
+}
 
-    Ok((h, session))
+async fn handle_input(mut rx: mpsc::Receiver<InputItem>) {
+    let mut items: HashMap<ChannelId, ContainerSink> = HashMap::new();
+
+    while let Some(item) = rx.recv().await {
+        match item {
+            InputItem::Channel(id, sink) => {
+                if items.contains_key(&id) {
+                    eprintln!("already contains active key: {:?}", &id);
+                    continue;
+                }
+
+                items.insert(id, sink);
+            }
+            InputItem::Message(id, data) => match items.get_mut(&id) {
+                Some(sink) => sink.write_all(&data).await.unwrap(),
+                None => eprintln!("recived data but had no sink for {:?}", id),
+            },
+        }
+    }
 }
 
 impl DockerHandler {
@@ -354,8 +366,10 @@ impl DockerHandler {
             .sessions
             .get_mut(&channel)
             .expect("data for uninitialised channel?");
-        if let ConnectionState::Connected(_, input) = &mut ssh_session.state {
-            input.write_all(&data).await.unwrap();
+        if let ConnectionState::Connected(_) = &mut ssh_session.state {
+            if let Err(e) = self.data_tx.send(InputItem::Message(channel, data)).await {
+                eprintln!("failed to send data: {}", e);
+            }
         }
 
         Ok((self, session))
@@ -385,7 +399,7 @@ impl DockerHandler {
             ConnectionState::NotConnected => {
                 panic!("how did we resize before a shell was requested?")
             }
-            ConnectionState::Connected(id, _) => id,
+            ConnectionState::Connected(id) => id,
         };
 
         eprintln!("resizing to {}x{}", h, w);
@@ -424,6 +438,7 @@ impl DockerHandler {
             }
         }
 
+        eprintln!("creating container");
         let container = self
             .client
             .create_container(
@@ -437,10 +452,13 @@ impl DockerHandler {
             .await
             .unwrap();
 
+        eprintln!("starting container");
         self.client
             .start_container(&container.id, None::<StartContainerOptions<&str>>)
             .await
             .unwrap();
+
+        eprintln!("started container");
 
         Ok(ContainerId(container.id))
     }
@@ -453,24 +471,26 @@ impl DockerHandler {
         let client = self.client.clone();
         let resources = self.active_resources.clone();
         let username = self.username.as_ref().expect("username unset");
-        let u = Username(username.to_string());
-        let id = match resources.join(&u).await.unwrap() {
+        let u = self.username.as_ref().unwrap();
+        let id = match resources.join(u).await.unwrap() {
             CountAndResource(_, Resource::Existing(id)) => Some(id),
-            CountAndResource(_, Resource::New) => {
-                let c = self.create_container();
-                let new_container = c.await.unwrap();
-                Some(new_container)
-            }
+            CountAndResource(_, Resource::New) => Some(self.create_container().await.unwrap()),
             CountAndResource(_, Resource::Pending) => todo!(),
         };
+
+        eprintln!("started container {:?}", id);
 
         let ssh_session = self.sessions.get_mut(&channel).expect("uninitialised");
         let env = ssh_session.env();
         let request_tty = env.is_some();
 
+        eprintln!("creating exec");
+
+        let container_id = &id.unwrap();
+
         let exec = client
             .create_exec(
-                DEST_CONTAINER,
+                container_id.0.as_str(),
                 CreateExecOptions {
                     attach_stdin: Some(request_tty),
                     attach_stdout: Some(request_tty),
@@ -481,7 +501,8 @@ impl DockerHandler {
                     ..Default::default()
                 },
             )
-            .await?;
+            .await
+            .unwrap();
 
         eprintln!("created exec {}", &exec.id);
 
@@ -510,7 +531,13 @@ impl DockerHandler {
         eprintln!("connected");
         // TODO: we need to create a channel and send input to a spawned task,
         // and keep the rx end of the channel in this map instead.
-        ssh_session.set_connected(exec.id.to_string(), input);
+        ssh_session.set_connected(exec.id.to_string());
+        if let Err(e) = self.active_resources.set_id(username, container_id).await {
+            eprintln!("failed to set container id: {}", e);
+        }
+        if let Err(e) = self.data_tx.send(InputItem::Channel(channel, input)).await {
+            eprintln!("failed to send channel: {}", e);
+        }
 
         tokio::spawn(handle_exec(
             Arc::clone(&self.client),
