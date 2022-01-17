@@ -113,7 +113,7 @@ impl Server for DockerServer {
     type Handler = DockerHandler;
 
     fn new(&mut self, addr: Option<std::net::SocketAddr>) -> Self::Handler {
-        eprintln!("making new handler: {:?}", addr);
+        log::debug!("making new handler: {:?}", addr);
         Self::Handler::new(Arc::clone(&self.client), Arc::clone(&self.active_resources))
     }
 }
@@ -200,7 +200,7 @@ impl Handler for DockerHandler {
     type FutureBool = Ready<Result<(Self, Session, bool), Self::Error>>;
 
     fn channel_open_session(mut self, channel: ChannelId, session: Session) -> Self::FutureUnit {
-        eprintln!("creating new session: {:?}", channel);
+        log::info!("creating new session: {:?}", channel);
         if self.sessions.contains_key(&channel) {
             panic!("already active session initialised on {:?}", channel);
         }
@@ -222,7 +222,7 @@ impl Handler for DockerHandler {
     }
 
     fn auth_none(mut self, user: &str) -> Self::FutureAuth {
-        eprintln!("user {} connecting", user);
+        log::info!("user {} connecting", user);
         self.username = Some(Username(user.to_string()));
         self.finished_auth(match user {
             "denbeigh" => Auth::Accept,
@@ -236,7 +236,7 @@ impl Handler for DockerHandler {
         _submethods: &str,
         _response: Option<Response<'_>>,
     ) -> Self::FutureAuth {
-        eprintln!("user {} connecting", user);
+        log::info!("user {} connecting", user);
         self.username = Some(Username(user.to_string()));
         self.finished_auth(match user {
             "denbeigh" => Auth::Accept,
@@ -305,8 +305,6 @@ async fn handle_exec(
     while let Some(e) = output.next().await {
         let e = e.unwrap();
 
-        eprintln!("sending data");
-
         match e {
             LogOutput::StdErr { message } => {
                 let msg = CryptoVec::from_slice(&message);
@@ -320,8 +318,6 @@ async fn handle_exec(
         };
     }
 
-    eprintln!("no more data");
-
     let exec = client.inspect_exec(&exec_id).await.unwrap();
     let code = exec.exit_code.unwrap_or(0);
 
@@ -331,8 +327,6 @@ async fn handle_exec(
         .unwrap();
     handle.eof(channel).await.unwrap();
     handle.close(channel).await.unwrap();
-
-    eprintln!("eof sent");
 }
 
 enum InputItem {
@@ -347,7 +341,7 @@ async fn handle_input(mut rx: mpsc::Receiver<InputItem>) {
         match item {
             InputItem::Channel(id, sink) => {
                 if items.contains_key(&id) {
-                    eprintln!("already contains active key: {:?}", &id);
+                    log::warn!("already contains active key: {:?}", &id);
                     continue;
                 }
 
@@ -355,7 +349,7 @@ async fn handle_input(mut rx: mpsc::Receiver<InputItem>) {
             }
             InputItem::Message(id, data) => match items.get_mut(&id) {
                 Some(sink) => sink.write_all(&data).await.unwrap(),
-                None => eprintln!("recived data but had no sink for {:?}", id),
+                None => log::warn!("received data but had no sink for {:?}", id),
             },
         }
     }
@@ -374,7 +368,7 @@ impl DockerHandler {
             .expect("data for uninitialised channel?");
         if let ConnectionState::Connected(_, _) = &mut ssh_session.state {
             if let Err(e) = self.data_tx.send(InputItem::Message(channel, data)).await {
-                eprintln!("failed to send data: {}", e);
+                log::error!("failed to send data: {}", e);
             }
         }
 
@@ -408,7 +402,7 @@ impl DockerHandler {
             ConnectionState::Connected(_, id) => id,
         };
 
-        eprintln!("resizing to {}x{}", h, w);
+        log::debug!("resizing to {}x{}", h, w);
 
         self.client
             .resize_exec(
@@ -444,7 +438,7 @@ impl DockerHandler {
             }
         }
 
-        eprintln!("creating container");
+        log::debug!("creating container");
         let container = self
             .client
             .create_container(
@@ -458,13 +452,13 @@ impl DockerHandler {
             .await
             .unwrap();
 
-        eprintln!("starting container");
+        log::info!("starting container {}", &container.id);
         self.client
             .start_container(&container.id, None::<StartContainerOptions<&str>>)
             .await
             .unwrap();
 
-        eprintln!("started container");
+        log::debug!("started container");
 
         Ok(ContainerId(container.id))
     }
@@ -484,13 +478,13 @@ impl DockerHandler {
             CountAndResource(_, Resource::Existing(id)) => Some(id),
         };
 
-        eprintln!("started container {:?}", id);
+        log::debug!("started container {:?}", id);
 
         let ssh_session = self.sessions.get_mut(&channel).expect("uninitialised");
         let env = ssh_session.env();
         let request_tty = env.is_some();
 
-        eprintln!("creating exec");
+        log::debug!("creating exec");
 
         let container_id = &id.unwrap();
 
@@ -510,7 +504,7 @@ impl DockerHandler {
             .await
             .unwrap();
 
-        eprintln!("created exec {}", &exec.id);
+        log::debug!("created exec {}", &exec.id);
 
         let exec_hand = client
             .start_exec(&exec.id, Some(StartExecOptions { detach: false }))
@@ -534,16 +528,16 @@ impl DockerHandler {
             StartExecResults::Detached => panic!("detached?"),
         };
 
-        eprintln!("connected");
+        log::debug!("connected");
         // TODO: we need to create a channel and send input to a spawned task,
         // and keep the rx end of the channel in this map instead.
         let exec_id = ExecId(exec.id.to_string());
         ssh_session.set_connected(container_id.clone(), exec_id);
         if let Err(e) = self.active_resources.set_id(username, container_id).await {
-            eprintln!("failed to set container id: {}", e);
+            log::error!("failed to set container id: {}", e);
         }
         if let Err(e) = self.data_tx.send(InputItem::Channel(channel, input)).await {
-            eprintln!("failed to send channel: {}", e);
+            log::error!("failed to send channel: {}", e);
         }
 
         tokio::spawn(handle_exec(
@@ -562,7 +556,7 @@ impl DockerHandler {
         channel: ChannelId,
         session: Session,
     ) -> Result<(Self, Session), HandlerError> {
-        eprintln!("channel closed: {:?}", &channel);
+        log::debug!("channel closed: {:?}", &channel);
         if let ConnectionState::Connected(c_id, _) = self.sessions.remove(&channel).unwrap().state {
             let state = self
                 .active_resources
@@ -580,25 +574,25 @@ impl DockerHandler {
 }
 
 async fn cleanup_container(client: Arc<Docker>, id: ContainerId) {
-    eprintln!("stopping container {}", &id.0);
+    log::info!("stopping container {}", &id.0);
 
     if let Err(e) = client.stop_container(id.0.as_str(), None).await {
-        eprintln!("stopping container {} failed: {}", &id.0, e);
-        eprintln!("killing container {}", &id.0);
+        log::warn!("stopping container {} failed: {}", &id.0, e);
+        log::info!("killing container {}", &id.0);
 
         let opts = KillContainerOptions { signal: "SIGKILL" };
         if let Err(e) = client.kill_container(id.0.as_str(), Some(opts)).await {
-            eprintln!("killing container {} failed: {}", &id.0, e);
+            log::warn!("killing container {} failed: {}", &id.0, e);
             return;
         }
     }
 
-    eprintln!("removing container {}", &id.0);
+    log::info!("removing container {}", &id.0);
     let opts = RemoveContainerOptions {
         force: true,
         ..Default::default()
     };
     if let Err(e) = client.remove_container(&id.0, Some(opts)).await {
-        eprintln!("removing container {} failed: {}", &id.0, e);
+        log::warn!("removing container {} failed: {}", &id.0, e);
     }
 }

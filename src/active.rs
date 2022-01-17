@@ -135,8 +135,8 @@ where
         cmd.arg("GET").arg(self.count_key(key));
         let n: Option<usize> = cmd.query_async(&mut *conn).await.unwrap();
 
-        eprintln!("see count: {:?}", n);
-        eprintln!("setting id: {:?} -> {:?}", key, v);
+        log::debug!("see count: {:?}", n);
+        log::debug!("setting id: {:?} -> {:?}", key, v);
         let res_key = self.resource_id_key(key);
         let mut cmd = redis::Cmd::new();
         cmd.arg("SET").arg(&res_key).arg(v.as_ref());
@@ -208,7 +208,7 @@ where
             Tx::Abort(v) => return Ok((conn, v)),
             Tx::Continue(pl, v) => {
                 let res: Option<()> = pl.query_async(&mut *conn).await.unwrap();
-                eprintln!("transaction: {:?} {}/{}", res, i + 1, TRANSACTION_ATTEMPTS);
+                log::debug!("transaction: {:?} {}/{}", res, i + 1, TRANSACTION_ATTEMPTS);
                 match res {
                     Some(_) => return Ok((conn, v)),
                     None => continue,
@@ -228,7 +228,7 @@ async fn join_txn<V: From<String> + AsRef<str> + Debug>(
 
     cmd.arg("MGET").arg(&ck).arg(&rk);
     let data: OptionalCountAndResource<V> = cmd.query_async(&mut *conn).await.unwrap();
-    eprintln!("MGET #1: {:?}", &data);
+    log::debug!("MGET #1: {:?}", &data);
 
     let (n, id, res) = match data.transpose() {
         Some(CountAndResource(s, Resource::Existing(id))) => {
@@ -252,9 +252,12 @@ async fn join_txn<V: From<String> + AsRef<str> + Debug>(
         .ignore()
         .cmd("EXEC");
 
-    eprintln!(
+    log::debug!(
         "query: MULTI / SET {} {} / SET {} {} / EXEC",
-        &ck, n, &rk, id
+        &ck,
+        n,
+        &rk,
+        id
     );
 
     Ok((conn, Tx::Continue(pl, Some(CountAndResource(n, res)))))
