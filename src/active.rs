@@ -1,4 +1,5 @@
 use std::convert::Infallible;
+use std::fmt::Debug;
 use std::marker::PhantomData;
 
 use bb8_redis::bb8::{Pool, PooledConnection};
@@ -11,7 +12,8 @@ const RESOURCE_PENDING: &str = "<pending>";
 
 const TRANSACTION_ATTEMPTS: usize = 3;
 
-pub enum Resource<V> {
+#[derive(Debug)]
+pub enum Resource<V: Debug> {
     New,
     Pending,
     Existing(V),
@@ -22,34 +24,35 @@ pub enum PoolState {
     NotEmpty,
 }
 
-pub struct OptionalCountAndResource<V>(Option<(usize, Resource<V>)>);
+#[derive(Debug)]
+pub struct OptionalCountAndResource<V: Debug>(Option<(usize, Resource<V>)>);
 
-impl<V: From<String>> FromRedisValue for OptionalCountAndResource<V> {
+impl<V: From<String> + Debug> FromRedisValue for OptionalCountAndResource<V> {
     fn from_redis_value(v: &Value) -> RedisResult<Self> {
-        let v: (Option<usize>, Option<String>) = redis::from_redis_value(v)?;
+        let (n, id): (Option<usize>, Option<String>) = redis::from_redis_value(v)?;
 
-        Ok(match v {
-            (Some(s), Some(r)) => {
-                let resource = Resource::Existing(V::from(r));
-                Self(Some((s, resource)))
-            }
-            (None, None) => Self(None),
-            _ => unreachable!(),
-        })
+        Ok(Self(match (n, id.as_deref()) {
+            (Some(n), Some(RESOURCE_PENDING)) => Some((n, Resource::Pending)),
+            (Some(n), Some(RESOURCE_NEW)) => Some((n, Resource::New)),
+            (Some(n), Some(_)) => Some((n, Resource::Existing(V::from(id.unwrap())))),
+            (None, None) => None,
+            (Some(_), None) => panic!("count set, resource not set"),
+            (None, Some(_)) => panic!("resource set, count not set"),
+        }))
     }
 }
 
-impl<V> OptionalCountAndResource<V> {
+impl<V: Debug> OptionalCountAndResource<V> {
     pub fn transpose(self) -> Option<CountAndResource<V>> {
         self.0.map(|r| CountAndResource(r.0, r.1))
     }
 }
 
-pub struct CountAndResource<V>(pub usize, pub Resource<V>);
+pub struct CountAndResource<V: Debug>(pub usize, pub Resource<V>);
 
 impl<V> ToRedisArgs for Resource<V>
 where
-    V: AsRef<str>,
+    V: AsRef<str> + Debug,
 {
     fn write_redis_args<W>(&self, out: &mut W)
     where
@@ -65,7 +68,7 @@ where
 
 impl<V> FromRedisValue for Resource<V>
 where
-    V: From<String>,
+    V: From<String> + Debug,
 {
     fn from_redis_value(v: &Value) -> RedisResult<Self> {
         let s: String = redis::from_redis_value(v)?;
@@ -111,8 +114,8 @@ pub trait Key {
 
 impl<K, V> ResourcePool<K, V>
 where
-    K: Key,
-    V: AsRef<str> + From<String> + Sync,
+    K: Key + Debug,
+    V: AsRef<str> + From<String> + Sync + Debug,
 {
     async fn get_conn(&self) -> Result<PooledConnection<'_, RedisConnectionManager>, Infallible> {
         Ok(self.pool.get().await.unwrap())
@@ -127,8 +130,14 @@ where
     }
 
     pub async fn set_id(&self, key: &K, v: &V) -> Result<(), Infallible> {
-        let res_key = self.resource_id_key(key);
         let mut conn = self.get_conn().await.unwrap();
+        let mut cmd = redis::Cmd::new();
+        cmd.arg("GET").arg(self.count_key(key));
+        let n: Option<usize> = cmd.query_async(&mut *conn).await.unwrap();
+
+        eprintln!("see count: {:?}", n);
+        eprintln!("setting id: {:?} -> {:?}", key, v);
+        let res_key = self.resource_id_key(key);
         let mut cmd = redis::Cmd::new();
         cmd.arg("SET").arg(&res_key).arg(v.as_ref());
         let _: () = cmd.query_async(&mut *conn).await.unwrap();
@@ -184,7 +193,7 @@ where
     A: Clone,
     F: Fn(RedisConn<'a>, A) -> ConnFut,
 {
-    for _ in 0..TRANSACTION_ATTEMPTS {
+    for i in 0..TRANSACTION_ATTEMPTS {
         let mut pl = redis::pipe();
         pl.cmd("WATCH");
         for i in keys {
@@ -199,6 +208,7 @@ where
             Tx::Abort(v) => return Ok((conn, v)),
             Tx::Continue(pl, v) => {
                 let res: Option<()> = pl.query_async(&mut *conn).await.unwrap();
+                eprintln!("transaction: {:?} {}/{}", res, i + 1, TRANSACTION_ATTEMPTS);
                 match res {
                     Some(_) => return Ok((conn, v)),
                     None => continue,
@@ -209,7 +219,7 @@ where
     panic!("too many attempts");
 }
 
-async fn join_txn<V: From<String>>(
+async fn join_txn<V: From<String> + AsRef<str> + Debug>(
     mut conn: RedisConn<'_>,
     args: (String, String),
 ) -> RedisResult<(RedisConn<'_>, Tx<Option<CountAndResource<V>>>)> {
@@ -218,11 +228,15 @@ async fn join_txn<V: From<String>>(
 
     cmd.arg("MGET").arg(&ck).arg(&rk);
     let data: OptionalCountAndResource<V> = cmd.query_async(&mut *conn).await.unwrap();
-    if let Some(r) = data.transpose() {
-        let n = r.0 + 1;
-        let mut pl = redis::pipe();
-        pl.cmd("SET").arg(&ck).arg(n);
-        return Ok((conn, Tx::Continue(pl, Some(CountAndResource(n, r.1)))));
+    eprintln!("MGET #1: {:?}", &data);
+
+    let (n, id, res) = match data.transpose() {
+        Some(CountAndResource(s, Resource::Existing(id))) => {
+            (s + 1, id.as_ref().to_string(), Resource::Existing(id))
+        }
+        None => (1, RESOURCE_PENDING.to_string(), Resource::New),
+        Some(CountAndResource(_, Resource::Pending)) => todo!(),
+        _ => todo!(),
     };
 
     let mut pl = redis::pipe();
@@ -230,18 +244,20 @@ async fn join_txn<V: From<String>>(
         .ignore()
         .cmd("SET")
         .arg(&ck)
-        .arg::<usize>(1)
+        .arg::<usize>(n)
         .ignore()
         .cmd("SET")
         .arg(&rk)
-        .arg(RESOURCE_PENDING)
+        .arg(&id)
         .ignore()
         .cmd("EXEC");
 
-    Ok((
-        conn,
-        Tx::Continue(pl, Some(CountAndResource(1, Resource::New))),
-    ))
+    eprintln!(
+        "query: MULTI / SET {} {} / SET {} {} / EXEC",
+        &ck, n, &rk, id
+    );
+
+    Ok((conn, Tx::Continue(pl, Some(CountAndResource(n, res)))))
 }
 
 // Needs to:
@@ -249,7 +265,7 @@ async fn join_txn<V: From<String>>(
 //  - If just us, remove the session and mark that the caller needs to clean up
 //  - If somebody else, decrement the count and mark that the caller doesn't
 //    need to do anything
-async fn leave_txn<'a, 'b, V: AsRef<str> + From<String>>(
+async fn leave_txn<'a, 'b, V: AsRef<str> + From<String> + Debug>(
     mut conn: RedisConn<'a>,
     args: (String, String, &'b V),
 ) -> RedisResult<(RedisConn<'a>, Tx<PoolState>)> {
@@ -259,16 +275,19 @@ async fn leave_txn<'a, 'b, V: AsRef<str> + From<String>>(
     cmd.arg("MGET").arg(&count_key).arg(&res_key);
     let data: OptionalCountAndResource<V> = cmd.query_async(&mut *conn).await.unwrap();
     let mut pl = redis::pipe();
+    pl.cmd("MULTI").ignore();
     let state = match data.transpose() {
         None | Some(CountAndResource(0, _)) | Some(CountAndResource(1, _)) => {
-            pl.cmd("DEL").arg(&res_key).arg(&count_key);
+            pl.cmd("DEL").arg(&res_key).ignore();
+            pl.cmd("DEL").arg(&count_key).ignore();
             PoolState::Empty
         }
-        Some(CountAndResource(_, _)) => {
-            pl.cmd("DECR").arg(&count_key);
+        Some(CountAndResource(n, _)) => {
+            pl.cmd("SET").arg(&count_key).arg(n - 1).ignore();
             PoolState::NotEmpty
         }
     };
 
+    pl.cmd("EXEC");
     Ok((conn, Tx::Continue(pl, state)))
 }

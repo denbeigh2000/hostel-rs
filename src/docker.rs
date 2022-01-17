@@ -4,7 +4,10 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use bollard::container::{Config, CreateContainerOptions, LogOutput, StartContainerOptions};
+use bollard::container::{
+    Config, CreateContainerOptions, KillContainerOptions, LogOutput, RemoveContainerOptions,
+    StartContainerOptions,
+};
 use bollard::exec::{CreateExecOptions, ResizeExecOptions, StartExecOptions, StartExecResults};
 use bollard::image::CreateImageOptions;
 use bollard::Docker;
@@ -16,7 +19,7 @@ use thrussh::{ChannelId, CryptoVec};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 
-use crate::active::{CountAndResource, Key, Resource, ResourcePool};
+use crate::active::{CountAndResource, Key, PoolState, Resource, ResourcePool};
 
 type LogStream = Pin<Box<dyn Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>;
 type ContainerSink = Pin<Box<dyn AsyncWrite + Send>>;
@@ -42,10 +45,12 @@ impl SSHSession {
             .map(|p| vec![format!("SHELL={}", p.term)])
     }
 
-    pub fn set_connected(&mut self, exec_id: String) {
+    pub fn set_connected(&mut self, container_id: ContainerId, exec_id: ExecId) {
         match self.state {
-            ConnectionState::Connected(_) => panic!("already connected"),
-            ConnectionState::NotConnected => self.state = ConnectionState::Connected(exec_id),
+            ConnectionState::Connected(_, _) => panic!("already connected"),
+            ConnectionState::NotConnected => {
+                self.state = ConnectionState::Connected(container_id, exec_id)
+            }
         }
     }
 }
@@ -61,7 +66,7 @@ impl Default for SSHSession {
 
 pub enum ConnectionState {
     NotConnected,
-    Connected(String),
+    Connected(ContainerId, ExecId),
 }
 
 #[derive(Debug)]
@@ -125,6 +130,7 @@ impl DockerServer {
     }
 }
 
+#[derive(Debug)]
 pub struct Username(String);
 
 impl Key for Username {
@@ -137,8 +143,11 @@ impl Key for Username {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct ContainerId(String);
+
+#[derive(Clone, Debug)]
+pub struct ExecId(String);
 
 impl From<String> for ContainerId {
     fn from(s: String) -> Self {
@@ -281,11 +290,8 @@ impl Handler for DockerHandler {
             .boxed()
     }
 
-    fn channel_close(mut self, channel: ChannelId, session: Session) -> Self::FutureUnit {
-        self.sessions.remove(&channel).unwrap();
-        eprintln!("channel closed: {:?}", &channel);
-
-        self.finished(session)
+    fn channel_close(self, channel: ChannelId, session: Session) -> Self::FutureUnit {
+        self.handle_close(channel, session).boxed()
     }
 }
 
@@ -366,7 +372,7 @@ impl DockerHandler {
             .sessions
             .get_mut(&channel)
             .expect("data for uninitialised channel?");
-        if let ConnectionState::Connected(_) = &mut ssh_session.state {
+        if let ConnectionState::Connected(_, _) = &mut ssh_session.state {
             if let Err(e) = self.data_tx.send(InputItem::Message(channel, data)).await {
                 eprintln!("failed to send data: {}", e);
             }
@@ -395,18 +401,18 @@ impl DockerHandler {
             None => unreachable!(),
         }
 
-        let id = match &ssh_session.state {
+        let exec_id = match &ssh_session.state {
             ConnectionState::NotConnected => {
                 panic!("how did we resize before a shell was requested?")
             }
-            ConnectionState::Connected(id) => id,
+            ConnectionState::Connected(_, id) => id,
         };
 
         eprintln!("resizing to {}x{}", h, w);
 
         self.client
             .resize_exec(
-                id,
+                &exec_id.0,
                 ResizeExecOptions {
                     height: h,
                     width: w,
@@ -473,9 +479,9 @@ impl DockerHandler {
         let username = self.username.as_ref().expect("username unset");
         let u = self.username.as_ref().unwrap();
         let id = match resources.join(u).await.unwrap() {
-            CountAndResource(_, Resource::Existing(id)) => Some(id),
             CountAndResource(_, Resource::New) => Some(self.create_container().await.unwrap()),
             CountAndResource(_, Resource::Pending) => todo!(),
+            CountAndResource(_, Resource::Existing(id)) => Some(id),
         };
 
         eprintln!("started container {:?}", id);
@@ -531,7 +537,8 @@ impl DockerHandler {
         eprintln!("connected");
         // TODO: we need to create a channel and send input to a spawned task,
         // and keep the rx end of the channel in this map instead.
-        ssh_session.set_connected(exec.id.to_string());
+        let exec_id = ExecId(exec.id.to_string());
+        ssh_session.set_connected(container_id.clone(), exec_id);
         if let Err(e) = self.active_resources.set_id(username, container_id).await {
             eprintln!("failed to set container id: {}", e);
         }
@@ -548,5 +555,50 @@ impl DockerHandler {
         ));
 
         Ok((self, session))
+    }
+
+    async fn handle_close(
+        mut self,
+        channel: ChannelId,
+        session: Session,
+    ) -> Result<(Self, Session), HandlerError> {
+        eprintln!("channel closed: {:?}", &channel);
+        if let ConnectionState::Connected(c_id, _) = self.sessions.remove(&channel).unwrap().state {
+            let state = self
+                .active_resources
+                .leave(self.username.as_ref().unwrap(), &c_id)
+                .await
+                .unwrap();
+            if matches!(state, PoolState::Empty) {
+                let client = self.client.clone();
+                tokio::spawn(cleanup_container(client, c_id));
+            }
+        };
+
+        Ok((self, session))
+    }
+}
+
+async fn cleanup_container(client: Arc<Docker>, id: ContainerId) {
+    eprintln!("stopping container {}", &id.0);
+
+    if let Err(e) = client.stop_container(id.0.as_str(), None).await {
+        eprintln!("stopping container {} failed: {}", &id.0, e);
+        eprintln!("killing container {}", &id.0);
+
+        let opts = KillContainerOptions { signal: "SIGKILL" };
+        if let Err(e) = client.kill_container(id.0.as_str(), Some(opts)).await {
+            eprintln!("killing container {} failed: {}", &id.0, e);
+            return;
+        }
+    }
+
+    eprintln!("removing container {}", &id.0);
+    let opts = RemoveContainerOptions {
+        force: true,
+        ..Default::default()
+    };
+    if let Err(e) = client.remove_container(&id.0, Some(opts)).await {
+        eprintln!("removing container {} failed: {}", &id.0, e);
     }
 }
