@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::convert::{Infallible, TryInto};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use bollard::container::{
@@ -17,7 +18,7 @@ use thiserror::Error;
 use thrussh::server::{Auth, Handler, Response, Server, Session};
 use thrussh::{ChannelId, CryptoVec};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use crate::active::{CountAndResource, Key, PoolState, Resource, ResourcePool};
 
@@ -104,27 +105,39 @@ pub enum HandlerError {
     Docker(#[from] bollard::errors::Error),
 }
 
-pub struct DockerServer {
+pub struct HostelServer {
     client: Arc<Docker>,
+    connected: Arc<AtomicUsize>,
+    connected_rx: Arc<watch::Sender<usize>>,
     active_resources: Arc<ResourcePool<Username, ContainerId>>,
 }
 
-impl Server for DockerServer {
-    type Handler = DockerHandler;
+impl Server for HostelServer {
+    type Handler = HostelHandler;
 
     fn new(&mut self, addr: Option<std::net::SocketAddr>) -> Self::Handler {
         log::debug!("making new handler: {:?}", addr);
-        Self::Handler::new(Arc::clone(&self.client), Arc::clone(&self.active_resources))
+        Self::Handler::new(
+            Arc::clone(&self.client),
+            Arc::clone(&self.connected),
+            Arc::clone(&self.connected_rx),
+            Arc::clone(&self.active_resources),
+        )
     }
 }
 
-impl DockerServer {
+impl HostelServer {
     pub fn new(
         client: Arc<Docker>,
+        connected_rx: Arc<watch::Sender<usize>>,
         active_resources: Arc<ResourcePool<Username, ContainerId>>,
     ) -> Self {
+        let connected = Arc::new(AtomicUsize::from(0));
+        connected_rx.send(0).unwrap();
         Self {
             client,
+            connected,
+            connected_rx,
             active_resources,
         }
     }
@@ -161,26 +174,31 @@ impl AsRef<str> for ContainerId {
     }
 }
 
-pub struct DockerHandler {
+pub struct HostelHandler {
     client: Arc<Docker>,
     active_resources: Arc<ResourcePool<Username, ContainerId>>,
     sessions: HashMap<ChannelId, SSHSession>,
+    connected: Arc<AtomicUsize>,
+    connected_tx: Arc<watch::Sender<usize>>,
     username: Option<Username>,
     data_tx: mpsc::Sender<InputItem>,
 }
 
-impl DockerHandler {
+impl HostelHandler {
     pub fn new(
         client: Arc<Docker>,
+        connected: Arc<AtomicUsize>,
+        connected_tx: Arc<watch::Sender<usize>>,
         active_resources: Arc<ResourcePool<Username, ContainerId>>,
     ) -> Self {
         let sessions = HashMap::new();
         let (data_tx, data_rx) = mpsc::channel(24);
         tokio::spawn(handle_input(data_rx));
-
         Self {
             client,
             sessions,
+            connected,
+            connected_tx,
             active_resources,
             username: None,
             data_tx,
@@ -190,7 +208,7 @@ impl DockerHandler {
 
 type BoxedFuture<V> = Pin<Box<dyn Future<Output = V> + Send>>;
 
-impl Handler for DockerHandler {
+impl Handler for HostelHandler {
     type Error = HandlerError;
 
     type FutureAuth = Ready<Result<(Self, Auth), Self::Error>>;
@@ -206,6 +224,9 @@ impl Handler for DockerHandler {
         }
 
         self.sessions.insert(channel, Default::default());
+        let n = self.connected.fetch_add(1, Ordering::SeqCst) + 1;
+        log::info!("joining, reporting {} items", n);
+        self.connected_tx.send(n).unwrap();
         self.finished(session)
     }
 
@@ -355,7 +376,7 @@ async fn handle_input(mut rx: mpsc::Receiver<InputItem>) {
     }
 }
 
-impl DockerHandler {
+impl HostelHandler {
     async fn handle_data(
         mut self,
         channel: ChannelId,
@@ -421,7 +442,7 @@ impl DockerHandler {
     async fn create_container(&self) -> Result<ContainerId, Infallible> {
         let mut info = self.client.create_image(
             Some(CreateImageOptions {
-                from_image: "ubuntu:latest",
+                from_image: "fedora:latest",
                 ..Default::default()
             }),
             None,
@@ -565,8 +586,14 @@ impl DockerHandler {
                 .unwrap();
             if matches!(state, PoolState::Empty) {
                 let client = self.client.clone();
-                tokio::spawn(cleanup_container(client, c_id));
+                cleanup_container(client, c_id).await;
             }
+
+            // Only send this once we've finished cleaning up containers, to
+            // avoid premature shutdown.
+            let n = self.connected.fetch_sub(1, Ordering::SeqCst) - 1;
+            log::info!("leaving, reporting {} items", n);
+            self.connected_tx.send(n).unwrap();
         };
 
         Ok((self, session))
