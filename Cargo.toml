@@ -7,6 +7,7 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+bb8-redis = "0.10"
 bollard = "0.11"
 futures = "0.3"
 thiserror = "1.0"
