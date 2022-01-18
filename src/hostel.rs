@@ -15,12 +15,15 @@ use bollard::Docker;
 use futures::future::{ready, FutureExt, Ready};
 use futures::{Stream, StreamExt};
 use thiserror::Error;
-use thrussh::server::{Auth, Handler, Response, Server as ThrusshServer, Session};
+use thrussh::server::{Auth, Handler, Response, Session};
 use thrussh::{ChannelId, CryptoVec};
+use thrussh_keys::key::PublicKey;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
 use crate::active::{CountAndResource, Key, PoolState, Resource, ResourcePool};
+use crate::config;
+use crate::ssh_utils::clone_key;
 
 type LogStream = Pin<Box<dyn Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>;
 type ContainerSink = Pin<Box<dyn AsyncWrite + Send>>;
@@ -30,7 +33,7 @@ pub struct SSHSession {
     pub pty_data: Option<PtyData>,
 }
 
-pub trait Server: ThrusshServer {
+pub trait Server: thrussh::server::Server {
     // TODO: Counting/logging functionality should probably be moved inside the
     // "server" type, and it should just expose a oneshot that is resolved when
     // it is safe to shut down
@@ -114,19 +117,21 @@ pub enum HandlerError {
 
 pub struct HostelServer {
     client: Arc<Docker>,
+    config: Arc<config::MetaConfig>,
     connected: Arc<AtomicUsize>,
     connected_tx: Arc<watch::Sender<usize>>,
     connected_rx: watch::Receiver<usize>,
     active_resources: Arc<ResourcePool<Username, ContainerId>>,
 }
 
-impl ThrusshServer for HostelServer {
+impl thrussh::server::Server for HostelServer {
     type Handler = HostelHandler;
 
     fn new(&mut self, addr: Option<std::net::SocketAddr>) -> Self::Handler {
         log::debug!("making new handler: {:?}", addr);
         Self::Handler::new(
             Arc::clone(&self.client),
+            Arc::clone(&self.config),
             Arc::clone(&self.connected),
             Arc::clone(&self.connected_tx),
             Arc::clone(&self.active_resources),
@@ -143,14 +148,17 @@ impl Server for HostelServer {
 impl HostelServer {
     pub fn new(
         client: Arc<Docker>,
+        config: config::MetaConfig,
         active_resources: Arc<ResourcePool<Username, ContainerId>>,
     ) -> Self {
         let (connected_tx, connected_rx) = watch::channel(8);
         let connected_tx = Arc::new(connected_tx);
         let connected = Arc::new(AtomicUsize::from(0));
         connected_tx.send(0).unwrap();
+        let config = Arc::new(config);
         Self {
             client,
+            config,
             connected,
             connected_rx,
             connected_tx,
@@ -192,6 +200,7 @@ impl AsRef<str> for ContainerId {
 
 pub struct HostelHandler {
     client: Arc<Docker>,
+    config: Arc<config::MetaConfig>,
     active_resources: Arc<ResourcePool<Username, ContainerId>>,
     sessions: HashMap<ChannelId, SSHSession>,
     connected: Arc<AtomicUsize>,
@@ -203,6 +212,7 @@ pub struct HostelHandler {
 impl HostelHandler {
     pub fn new(
         client: Arc<Docker>,
+        config: Arc<config::MetaConfig>,
         connected: Arc<AtomicUsize>,
         connected_tx: Arc<watch::Sender<usize>>,
         active_resources: Arc<ResourcePool<Username, ContainerId>>,
@@ -212,6 +222,7 @@ impl HostelHandler {
         tokio::spawn(handle_input(data_rx));
         Self {
             client,
+            config,
             sessions,
             connected,
             connected_tx,
@@ -227,7 +238,7 @@ type BoxedFuture<V> = Pin<Box<dyn Future<Output = V> + Send>>;
 impl Handler for HostelHandler {
     type Error = HandlerError;
 
-    type FutureAuth = Ready<Result<(Self, Auth), Self::Error>>;
+    type FutureAuth = BoxedFuture<Result<(Self, Auth), Self::Error>>;
 
     type FutureUnit = BoxedFuture<Result<(Self, Session), Self::Error>>;
 
@@ -247,7 +258,7 @@ impl Handler for HostelHandler {
     }
 
     fn finished_auth(self, auth: Auth) -> Self::FutureAuth {
-        ready(Ok((self, auth)))
+        ready(Ok((self, auth))).boxed()
     }
 
     fn finished_bool(self, b: bool, session: Session) -> Self::FutureBool {
@@ -256,6 +267,20 @@ impl Handler for HostelHandler {
 
     fn finished(self, session: Session) -> Self::FutureUnit {
         ready(Ok((self, session))).boxed()
+    }
+
+    fn auth_publickey(mut self, user: &str, public_key: &PublicKey) -> Self::FutureAuth {
+        let key = clone_key(public_key);
+        let user = user.to_string();
+        self.username = Some(Username(user.clone()));
+        async move {
+            let auth = self.auth_pubkey(user, &key).await.unwrap();
+            Ok(match auth {
+                (s, true) => (s, Auth::Accept),
+                (s, false) => (s, Auth::Reject),
+            })
+        }
+        .boxed()
     }
 
     fn auth_none(mut self, user: &str) -> Self::FutureAuth {
@@ -456,9 +481,10 @@ impl HostelHandler {
     }
 
     async fn create_container(&self) -> Result<ContainerId, Infallible> {
+        let image = self.config.config.image.as_str();
         let mut info = self.client.create_image(
             Some(CreateImageOptions {
-                from_image: "fedora:latest",
+                from_image: image,
                 ..Default::default()
             }),
             None,
@@ -482,7 +508,7 @@ impl HostelHandler {
                 None::<CreateContainerOptions<&str>>,
                 Config {
                     entrypoint: Some(vec!["sleep", "infinity"]),
-                    image: Some("fedora:latest"),
+                    image: Some(image),
                     ..Default::default()
                 },
             )
@@ -513,8 +539,7 @@ impl HostelHandler {
     ) -> Result<(Self, Session), HandlerError> {
         let client = self.client.clone();
         let resources = self.active_resources.clone();
-        let username = self.username.as_ref().expect("username unset");
-        let u = self.username.as_ref().unwrap();
+        let u = self.username.as_ref().expect("username unset");
         let id = match resources.join(u).await.unwrap() {
             CountAndResource(_, Resource::New) => Some(self.create_container().await.unwrap()),
             CountAndResource(_, Resource::Pending) => todo!(),
@@ -616,6 +641,16 @@ impl HostelHandler {
         };
 
         Ok((self, session))
+    }
+
+    async fn auth_pubkey(
+        self,
+        user: String,
+        key: &PublicKey,
+    ) -> Result<(Self, bool), HandlerError> {
+        let user_keys = self.config.user_keys(user.as_str()).await.unwrap().unwrap();
+
+        Ok((self, user_keys.contains(key)))
     }
 }
 

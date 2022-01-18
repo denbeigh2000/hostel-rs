@@ -4,20 +4,19 @@ use std::time::Duration;
 use bb8_redis::bb8::Pool;
 use bb8_redis::RedisConnectionManager;
 use bollard::Docker;
-use futures::FutureExt;
 use hostel::active::ResourcePool;
+use hostel::config;
 use hostel::hostel::HostelServer;
 use hostel::server;
 use simplelog::{LevelFilter, TermLogger};
 use thrussh::server::Config as ThrusshConfig;
 use thrussh::MethodSet;
 use thrussh_keys::key::KeyPair;
-use tokio::sync::{oneshot, watch};
 
 #[tokio::main]
 async fn main() {
     TermLogger::init(
-        LevelFilter::Debug,
+        LevelFilter::Info,
         simplelog::Config::default(),
         simplelog::TerminalMode::Mixed,
         simplelog::ColorChoice::Auto,
@@ -31,11 +30,13 @@ async fn main() {
         ..Default::default()
     };
 
+    let hostel_config = config::MetaConfig::load(".").await.unwrap();
+
     let mgr = RedisConnectionManager::new("redis://localhost:6379").unwrap();
     let pool = Pool::builder().build(mgr).await.unwrap();
     let pool = ResourcePool::new(pool);
     let docker = Docker::connect_with_unix_defaults().unwrap();
-    let serv = HostelServer::new(Arc::new(docker), Arc::new(pool));
+    let serv = HostelServer::new(Arc::new(docker), hostel_config, Arc::new(pool));
 
     let bind_addr = "0.0.0.0:2222";
     log::info!("serving on {}", &bind_addr);
