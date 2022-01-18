@@ -17,7 +17,7 @@ use tokio::sync::{oneshot, watch};
 #[tokio::main]
 async fn main() {
     TermLogger::init(
-        LevelFilter::Info,
+        LevelFilter::Debug,
         simplelog::Config::default(),
         simplelog::TerminalMode::Mixed,
         simplelog::ColorChoice::Auto,
@@ -35,48 +35,10 @@ async fn main() {
     let pool = Pool::builder().build(mgr).await.unwrap();
     let pool = ResourcePool::new(pool);
     let docker = Docker::connect_with_unix_defaults().unwrap();
-    let (conn_tx, mut conn_rx) = watch::channel(8);
-    let serv = HostelServer::new(Arc::new(docker), Arc::new(conn_tx), Arc::new(pool));
+    let serv = HostelServer::new(Arc::new(docker), Arc::new(pool));
 
     let bind_addr = "0.0.0.0:2222";
     log::info!("serving on {}", &bind_addr);
 
-    let listener = tokio::net::TcpListener::bind(&bind_addr).await.unwrap();
-    let (stop_tx, stop_rx) = oneshot::channel();
-    let stop_rx = stop_rx.map(|_: Result<(), _>| ());
-    let serv_fut = server::serve(serv, stop_rx, listener, Arc::new(config));
-    let serv_hand = tokio::spawn(serv_fut);
-
-    tokio::select! {
-        _ = serv_hand => {
-            log::info!("Port closed/error serving, shutting down");
-        },
-        _ = tokio::signal::ctrl_c() => {
-            log::info!("received ^c");
-            stop_tx.send(()).unwrap();
-            let count = conn_rx.borrow_and_update();
-            if *count == 0 {
-                log::info!("no connected clients, shutting down");
-                return;
-            }
-
-            log::info!("{} connected clients, waiting to shut down", *count);
-            // this holds a read lock - make sure it doesn't stay in the loop's
-            // scope
-            drop(count);
-
-            while conn_rx.changed().await.is_ok() {
-                let count = conn_rx.borrow();
-                match *count {
-                    n @ 2.. => log::info!("{} clients still connected", n),
-                    1 => log::info!("1 client still connected"),
-                    0 => {
-                        log::info!("All clients disconnected, shutting down");
-                        return;
-                    },
-                    _ => unreachable!(),
-                }
-            }
-        },
-    }
+    server::serve(bind_addr, serv, config).await;
 }

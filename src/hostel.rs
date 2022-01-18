@@ -15,7 +15,7 @@ use bollard::Docker;
 use futures::future::{ready, FutureExt, Ready};
 use futures::{Stream, StreamExt};
 use thiserror::Error;
-use thrussh::server::{Auth, Handler, Response, Server, Session};
+use thrussh::server::{Auth, Handler, Response, Server as ThrusshServer, Session};
 use thrussh::{ChannelId, CryptoVec};
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
@@ -28,6 +28,13 @@ type ContainerSink = Pin<Box<dyn AsyncWrite + Send>>;
 pub struct SSHSession {
     pub state: ConnectionState,
     pub pty_data: Option<PtyData>,
+}
+
+pub trait Server: ThrusshServer {
+    // TODO: Counting/logging functionality should probably be moved inside the
+    // "server" type, and it should just expose a oneshot that is resolved when
+    // it is safe to shut down
+    fn remaining_connections(&self) -> watch::Receiver<usize>;
 }
 
 impl SSHSession {
@@ -108,11 +115,12 @@ pub enum HandlerError {
 pub struct HostelServer {
     client: Arc<Docker>,
     connected: Arc<AtomicUsize>,
-    connected_rx: Arc<watch::Sender<usize>>,
+    connected_tx: Arc<watch::Sender<usize>>,
+    connected_rx: watch::Receiver<usize>,
     active_resources: Arc<ResourcePool<Username, ContainerId>>,
 }
 
-impl Server for HostelServer {
+impl ThrusshServer for HostelServer {
     type Handler = HostelHandler;
 
     fn new(&mut self, addr: Option<std::net::SocketAddr>) -> Self::Handler {
@@ -120,24 +128,32 @@ impl Server for HostelServer {
         Self::Handler::new(
             Arc::clone(&self.client),
             Arc::clone(&self.connected),
-            Arc::clone(&self.connected_rx),
+            Arc::clone(&self.connected_tx),
             Arc::clone(&self.active_resources),
         )
+    }
+}
+
+impl Server for HostelServer {
+    fn remaining_connections(&self) -> watch::Receiver<usize> {
+        self.connected_rx.clone()
     }
 }
 
 impl HostelServer {
     pub fn new(
         client: Arc<Docker>,
-        connected_rx: Arc<watch::Sender<usize>>,
         active_resources: Arc<ResourcePool<Username, ContainerId>>,
     ) -> Self {
+        let (connected_tx, connected_rx) = watch::channel(8);
+        let connected_tx = Arc::new(connected_tx);
         let connected = Arc::new(AtomicUsize::from(0));
-        connected_rx.send(0).unwrap();
+        connected_tx.send(0).unwrap();
         Self {
             client,
             connected,
             connected_rx,
+            connected_tx,
             active_resources,
         }
     }
@@ -452,11 +468,11 @@ impl HostelHandler {
         while let Some(i) = info.next().await {
             let i = i.expect("error pulling");
             match (i.status, i.progress) {
-                (None, None) => eprintln!("unknown"),
-                (None, Some(p)) => eprintln!("(state unknown) {}", p),
+                (None, None) => eprintln!("(unknown)"),
+                (None, Some(p)) => eprintln!("(state unknown) {}\n", p),
                 (Some(s), None) => eprintln!("{}", s),
-                (Some(s), Some(p)) => eprintln!("{}: {}", s, p),
-            }
+                (Some(s), Some(p)) => eprintln!("{}: {}\n", s, p),
+            };
         }
 
         log::debug!("creating container");
@@ -465,15 +481,21 @@ impl HostelHandler {
             .create_container(
                 None::<CreateContainerOptions<&str>>,
                 Config {
-                    image: Some("ubuntu:latest"),
                     entrypoint: Some(vec!["sleep", "infinity"]),
+                    image: Some("fedora:latest"),
                     ..Default::default()
                 },
             )
             .await
             .unwrap();
 
-        log::info!("starting container {}", &container.id);
+        let cid = ContainerId(container.id.clone());
+        self.active_resources
+            .set_id(self.username.as_ref().unwrap(), &cid)
+            .await
+            .unwrap();
+
+        log::info!("starting container {:?}", &cid);
         self.client
             .start_container(&container.id, None::<StartContainerOptions<&str>>)
             .await
@@ -481,7 +503,7 @@ impl HostelHandler {
 
         log::debug!("started container");
 
-        Ok(ContainerId(container.id))
+        Ok(cid)
     }
 
     async fn handle_shell(
@@ -554,9 +576,6 @@ impl HostelHandler {
         // and keep the rx end of the channel in this map instead.
         let exec_id = ExecId(exec.id.to_string());
         ssh_session.set_connected(container_id.clone(), exec_id);
-        if let Err(e) = self.active_resources.set_id(username, container_id).await {
-            log::error!("failed to set container id: {}", e);
-        }
         if let Err(e) = self.data_tx.send(InputItem::Channel(channel, input)).await {
             log::error!("failed to send channel: {}", e);
         }
