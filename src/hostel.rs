@@ -481,7 +481,14 @@ impl HostelHandler {
     }
 
     async fn create_container(&self) -> Result<ContainerId, Infallible> {
-        let image = self.config.config.image.as_str();
+        let username = self.username.as_ref().unwrap();
+        let user_config = self.config.user_config(&username.0).await.unwrap();
+
+        let image = user_config
+            .as_ref()
+            .and_then(|c| c.image.as_deref())
+            .unwrap_or(self.config.config.image.as_str());
+
         let mut info = self.client.create_image(
             Some(CreateImageOptions {
                 from_image: image,
