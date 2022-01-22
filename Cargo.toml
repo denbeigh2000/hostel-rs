@@ -9,13 +9,14 @@ edition = "2021"
 [dependencies]
 bb8-redis = "0.10"
 bollard = "0.11"
+clap = { version = "3.0", features = ["default", "derive", "env"] }
 futures = "0.3"
 log = "0.4"
 serde = "1.0"
 serde_yaml = "0.8"
 simplelog = "0.11"
 thiserror = "1.0"
-thrussh = "0.32"
-thrussh-keys = "0.20"
+thrussh = { version = "0.33", features = ["openssl", "flate2"] }
+thrussh-keys = { version = "0.21", features = ["openssl"] }
 thrussh-libsodium = "0.2"
 tokio = { version = "1", features = ["full"] }
