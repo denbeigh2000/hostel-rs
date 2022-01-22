@@ -23,7 +23,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::active::{CountAndResource, Key, PoolState, Resource, ResourcePool};
 use crate::config;
-use crate::ssh_utils::clone_key;
+use crate::utils::ssh::clone_key;
 
 type LogStream = Pin<Box<dyn Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>;
 type ContainerSink = Pin<Box<dyn AsyncWrite + Send>>;
