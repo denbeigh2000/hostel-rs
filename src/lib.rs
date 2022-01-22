@@ -3,3 +3,4 @@
 pub mod active;
 pub mod hostel;
 pub mod server;
+pub mod ssh_utils;

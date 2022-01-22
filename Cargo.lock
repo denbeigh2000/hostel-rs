@@ -462,6 +462,7 @@ dependencies = [
  "thiserror",
  "thrussh",
  "thrussh-keys",
+ "thrussh-libsodium",
  "tokio",
 ]
 
