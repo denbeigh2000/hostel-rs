@@ -51,14 +51,26 @@ async fn main() {
 
     logging::init(args.log_level);
 
+    let hostel_config = config::MetaConfig::load(args.config_dir).await.unwrap();
+
+    let key_path = hostel_config.server_key_path();
+    let key = if key_path.exists() {
+        thrussh_keys::load_secret_key(key_path, None).unwrap()
+    } else {
+        let key_str = key_path.to_string_lossy();
+        log::warn!("No private key found at {key_str}");
+        log::warn!("Generating a random key");
+
+        let (_, secret_key) = thrussh_keys::key::ed25519::keypair();
+        KeyPair::Ed25519(secret_key)
+    };
+
     let config = ThrusshConfig {
         methods: MethodSet::from_iter([MethodSet::PUBLICKEY]),
         auth_rejection_time: args.ssh_auth_timeout,
-        keys: vec![KeyPair::generate_ed25519().unwrap()],
+        keys: vec![key],
         ..Default::default()
     };
-
-    let hostel_config = config::MetaConfig::load(args.config_dir).await.unwrap();
 
     let mgr = RedisConnectionManager::new(args.redis_url).unwrap();
     let pool = Pool::builder().build(mgr).await.unwrap();

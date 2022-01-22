@@ -35,6 +35,10 @@ impl MetaConfig {
         Ok(Self { config, config_dir })
     }
 
+    pub fn server_key_path(&self) -> PathBuf {
+        self.config_dir.join("id_ed25519")
+    }
+
     fn user_key_path(&self, user: &str) -> PathBuf {
         self.config_dir.join(user).join("authorized_keys")
     }
