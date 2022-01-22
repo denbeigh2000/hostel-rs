@@ -52,7 +52,7 @@ async fn main() {
     logging::init(args.log_level);
 
     let config = ThrusshConfig {
-        methods: MethodSet::from_iter([MethodSet::NONE, MethodSet::KEYBOARD_INTERACTIVE]),
+        methods: MethodSet::from_iter([MethodSet::PUBLICKEY]),
         auth_rejection_time: args.ssh_auth_timeout,
         keys: vec![KeyPair::generate_ed25519().unwrap()],
         ..Default::default()

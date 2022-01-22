@@ -3,6 +3,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use thrussh_keys::key::PublicKey;
+use thrussh_keys::parse_public_key_base64;
 use tokio::fs::File;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
@@ -55,7 +56,18 @@ impl MetaConfig {
                 continue;
             }
 
-            match thrussh_keys::parse_public_key_base64(line) {
+            log::info!("parsing: {}", line);
+            let mut split = line.split_whitespace();
+            let res = match (split.next(), split.next()) {
+                (Some(_), Some(key)) => parse_public_key_base64(key),
+                (Some(key), None) => thrussh_keys::parse_public_key_base64(key),
+                _ => {
+                    log::warn!("invalid key {line}, skipping");
+                    continue;
+                }
+            };
+
+            match res {
                 Ok(key) => keys.push(key),
                 Err(e) => log::warn!("failed to parse key: {}", e),
             }
