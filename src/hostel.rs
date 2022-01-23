@@ -21,8 +21,8 @@ use thrussh_keys::key::PublicKey;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, watch};
 
-use crate::active::{CountAndResource, Key, PoolState, Resource, ResourcePool};
-use crate::config;
+use crate::active::{CountAndResource, Key, PoolError, PoolState, Resource, ResourcePool};
+use crate::config::{self, KeyLoadError};
 use crate::utils::ssh::clone_key;
 
 type LogStream = Pin<Box<dyn Stream<Item = Result<LogOutput, bollard::errors::Error>> + Send>>;
@@ -113,6 +113,10 @@ pub enum HandlerError {
     UnhandledSSH(#[from] thrussh::Error),
     #[error("docker error: {0}")]
     Docker(#[from] bollard::errors::Error),
+    #[error("validating public key: {0}")]
+    PubkeyAuth(#[from] KeyLoadError),
+    #[error("handling shell request")]
+    Shell(#[from] ShellHandlerError),
 }
 
 pub struct HostelServer {
@@ -253,7 +257,9 @@ impl Handler for HostelHandler {
         self.sessions.insert(channel, Default::default());
         let n = self.connected.fetch_add(1, Ordering::SeqCst) + 1;
         log::info!("joining, reporting {} items", n);
-        self.connected_tx.send(n).unwrap();
+        if self.connected_tx.send(n).is_err() {
+            log::error!("not able to send new count on connection, may experience interrupts");
+        };
         self.finished(session)
     }
 
@@ -274,11 +280,11 @@ impl Handler for HostelHandler {
         let user = user.to_string();
         self.username = Some(Username(user.clone()));
         async move {
-            let auth = self.auth_pubkey(user, &key).await.unwrap();
-            Ok(match auth {
+            let auth = match self.auth_pubkey(user, &key).await? {
                 (s, true) => (s, Auth::Accept),
                 (s, false) => (s, Auth::Reject),
-            })
+            };
+            Ok(auth)
         }
         .boxed()
     }
@@ -332,7 +338,9 @@ impl Handler for HostelHandler {
         // of storing the sinks locally, we need to spawn a new task when we
         // create our exec thawe we pass the rx end of a channel to, then store
         // the tx end in our local map to send data from framework events.
-        self.handle_shell(channel, session).boxed()
+        self.handle_shell(channel, session)
+            .map(|r| r.map_err(|e| e.into()))
+            .boxed()
     }
 
     fn data(self, channel: ChannelId, data: &[u8], session: Session) -> Self::FutureUnit {
@@ -360,35 +368,67 @@ impl Handler for HostelHandler {
 async fn handle_exec(
     client: Arc<Docker>,
     exec_id: String,
+    handle: thrussh::server::Handle,
+    output: LogStream,
+    channel: ChannelId,
+) {
+    if let Err(e) = handle_exec_result(client, exec_id, handle, output, channel).await {
+        log::error!("error while handling exec: {e}");
+    }
+}
+
+#[derive(Debug, Error)]
+enum ExecHandleError {
+    #[error("reading from docker message queue: {0}")]
+    ReceivingMessage(bollard::errors::Error),
+    #[error("reading created exec: {0}")]
+    InspectExec(bollard::errors::Error),
+}
+
+async fn handle_exec_result(
+    client: Arc<Docker>,
+    exec_id: String,
     mut handle: thrussh::server::Handle,
     mut output: LogStream,
     channel: ChannelId,
-) {
+) -> Result<(), ExecHandleError> {
     while let Some(e) = output.next().await {
-        let e = e.unwrap();
+        let e = e.map_err(ExecHandleError::ReceivingMessage)?;
 
-        match e {
+        let res = match e {
             LogOutput::StdErr { message } => {
                 let msg = CryptoVec::from_slice(&message);
-                handle.extended_data(channel, 1, msg).await.unwrap();
+                Some(handle.extended_data(channel, 1, msg).await)
             }
             LogOutput::StdOut { message } => {
                 let msg = CryptoVec::from_slice(&message);
-                handle.data(channel, msg).await.unwrap();
+                Some(handle.data(channel, msg).await)
             }
-            _ => (),
+            _ => None,
         };
+
+        if let Some(Err(l)) = res {
+            log::warn!("dropped {} bytes of data to client", l.len());
+        }
     }
 
-    let exec = client.inspect_exec(&exec_id).await.unwrap();
-    let code = exec.exit_code.unwrap_or(0);
-
-    handle
-        .exit_status_request(channel, code as u32)
+    let exec = client
+        .inspect_exec(&exec_id)
         .await
-        .unwrap();
-    handle.eof(channel).await.unwrap();
-    handle.close(channel).await.unwrap();
+        .map_err(ExecHandleError::InspectExec)?;
+    let code = exec.exit_code.unwrap_or(0) as u32;
+
+    if handle.exit_status_request(channel, code).await.is_err() {
+        log::warn!("unable to send exit status to client");
+    }
+    if handle.eof(channel).await.is_err() {
+        log::warn!("unable to send EOF to client");
+    }
+    if handle.close(channel).await.is_err() {
+        log::warn!("unable to send EOF to client");
+    }
+
+    Ok(())
 }
 
 enum InputItem {
@@ -410,11 +450,45 @@ async fn handle_input(mut rx: mpsc::Receiver<InputItem>) {
                 items.insert(id, sink);
             }
             InputItem::Message(id, data) => match items.get_mut(&id) {
-                Some(sink) => sink.write_all(&data).await.unwrap(),
+                Some(sink) => {
+                    if let Err(e) = sink.write_all(&data).await {
+                        log::error!("failed to write data to container: {e}");
+                    }
+                }
                 None => log::warn!("received data but had no sink for {:?}", id),
             },
         }
     }
+}
+
+#[derive(Debug, Error)]
+pub enum ContainerCreateError {
+    #[error("parsing user config file: {0}")]
+    ParsingUserConfig(#[from] config::FileParseError),
+    #[error("creating new container: {0}")]
+    CreatingContainer(bollard::errors::Error),
+    #[error("setting store metadata: {0}")]
+    SettingMetadata(#[from] PoolError),
+    #[error("starting new container: {0}")]
+    StartingContainer(bollard::errors::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum ShellHandlerError {
+    #[error("joining/claiming new container: {0}")]
+    SettingMetadata(#[from] PoolError),
+    #[error("starting container exec: {0}")]
+    StartingExec(bollard::errors::Error),
+    #[error("creating container exec: {0}")]
+    CreatingExec(bollard::errors::Error),
+    #[error("starting new container: {0}")]
+    CreatingContainer(#[from] ContainerCreateError),
+}
+
+#[derive(Debug, Error)]
+pub enum CloseError {
+    #[error("marking resources freed")]
+    SettingMetadata(#[from] PoolError),
 }
 
 impl HostelHandler {
@@ -474,15 +548,14 @@ impl HostelHandler {
                     width: w,
                 },
             )
-            .await
-            .unwrap();
+            .await?;
 
         Ok((self, session))
     }
 
-    async fn create_container(&self) -> Result<ContainerId, Infallible> {
+    async fn create_container(&self) -> Result<ContainerId, ContainerCreateError> {
         let username = self.username.as_ref().unwrap();
-        let user_config = self.config.user_config(&username.0).await.unwrap();
+        let user_config = self.config.user_config(&username.0).await?;
 
         let image = user_config
             .as_ref()
@@ -520,19 +593,18 @@ impl HostelHandler {
                 },
             )
             .await
-            .unwrap();
+            .map_err(ContainerCreateError::CreatingContainer)?;
 
         let cid = ContainerId(container.id.clone());
         self.active_resources
             .set_id(self.username.as_ref().unwrap(), &cid)
-            .await
-            .unwrap();
+            .await?;
 
         log::info!("starting container {:?}", &cid);
         self.client
             .start_container(&container.id, None::<StartContainerOptions<&str>>)
             .await
-            .unwrap();
+            .map_err(ContainerCreateError::StartingContainer)?;
 
         log::debug!("started container");
 
@@ -543,12 +615,12 @@ impl HostelHandler {
         mut self,
         channel: ChannelId,
         session: Session,
-    ) -> Result<(Self, Session), HandlerError> {
+    ) -> Result<(Self, Session), ShellHandlerError> {
         let client = self.client.clone();
         let resources = self.active_resources.clone();
         let u = self.username.as_ref().expect("username unset");
-        let id = match resources.join(u).await.unwrap() {
-            CountAndResource(_, Resource::New) => Some(self.create_container().await.unwrap()),
+        let id = match resources.join(u).await? {
+            CountAndResource(_, Resource::New) => Some(self.create_container().await?),
             CountAndResource(_, Resource::Pending) => todo!(),
             CountAndResource(_, Resource::Existing(id)) => Some(id),
         };
@@ -577,16 +649,17 @@ impl HostelHandler {
                 },
             )
             .await
-            .unwrap();
+            .map_err(ShellHandlerError::CreatingExec)?;
 
         log::debug!("created exec {}", &exec.id);
 
         let exec_hand = client
             .start_exec(&exec.id, Some(StartExecOptions { detach: false }))
-            .await?;
+            .await
+            .map_err(ShellHandlerError::StartingExec)?;
 
         if let Some(info) = &ssh_session.pty_data {
-            client
+            if let Err(e) = client
                 .resize_exec(
                     &exec.id,
                     ResizeExecOptions {
@@ -595,7 +668,9 @@ impl HostelHandler {
                     },
                 )
                 .await
-                .unwrap();
+            {
+                log::warn!("failed to resize remote session: {e}");
+            }
         }
 
         let (output, input) = match exec_hand {
@@ -630,21 +705,29 @@ impl HostelHandler {
     ) -> Result<(Self, Session), HandlerError> {
         log::debug!("channel closed: {:?}", &channel);
         if let ConnectionState::Connected(c_id, _) = self.sessions.remove(&channel).unwrap().state {
-            let state = self
+            let state_res = self
                 .active_resources
                 .leave(self.username.as_ref().unwrap(), &c_id)
-                .await
-                .unwrap();
-            if matches!(state, PoolState::Empty) {
-                let client = self.client.clone();
-                cleanup_container(client, c_id).await;
+                .await;
+            match state_res {
+                Ok(state) => {
+                    if matches!(state, PoolState::Empty) {
+                        let client = self.client.clone();
+                        cleanup_container(client, c_id).await;
+                    }
+                }
+                Err(e) => {
+                    log::warn!("error marking container as cleaned up: {e}");
+                }
             }
 
             // Only send this once we've finished cleaning up containers, to
             // avoid premature shutdown.
             let n = self.connected.fetch_sub(1, Ordering::SeqCst) - 1;
             log::info!("leaving, reporting {} items", n);
-            self.connected_tx.send(n).unwrap();
+            if self.connected_tx.send(n).is_err() {
+                log::warn!("was not able to transmit remaining client count");
+            }
         };
 
         Ok((self, session))
@@ -655,9 +738,12 @@ impl HostelHandler {
         user: String,
         key: &PublicKey,
     ) -> Result<(Self, bool), HandlerError> {
-        let user_keys = self.config.user_keys(user.as_str()).await.unwrap().unwrap();
+        let contains = match self.config.user_keys(user.as_str()).await? {
+            Some(keys) => keys.contains(key),
+            None => false,
+        };
 
-        Ok((self, user_keys.contains(key)))
+        Ok((self, contains))
     }
 }
 

@@ -1,19 +1,29 @@
 use std::sync::Arc;
 
-use futures::{channel::oneshot, Future, FutureExt, StreamExt};
+use futures::channel::oneshot;
+use futures::{Future, FutureExt, StreamExt};
+use thiserror::Error;
 use thrussh::server::{run_stream, Config};
 use tokio::net::TcpListener;
 use tokio::net::ToSocketAddrs;
 
 use crate::hostel::Server;
 
-pub async fn serve<A, S>(bind_addr: A, serv: S, config: Config)
+#[derive(Debug, Error)]
+pub enum ServeError {
+    #[error("Binding TCP socket: {0}")]
+    BindTcp(std::io::Error),
+}
+
+pub async fn serve<A, S>(bind_addr: A, serv: S, config: Config) -> Result<(), ServeError>
 where
     A: ToSocketAddrs,
     S: Server + 'static + Send,
 {
     let mut conn_rx = serv.remaining_connections();
-    let listener = TcpListener::bind(&bind_addr).await.unwrap();
+    let listener = TcpListener::bind(&bind_addr)
+        .await
+        .map_err(ServeError::BindTcp)?;
     let (stop_tx, stop_rx) = oneshot::channel();
     let stop_rx = stop_rx.map(|_: Result<(), _>| ());
 
@@ -26,11 +36,13 @@ where
         },
         _ = tokio::signal::ctrl_c() => {
             log::info!("received ^c");
-            stop_tx.send(()).unwrap();
+            if stop_tx.send(()).is_err() {
+                log::warn!("dependent threads have already stopped?");
+            }
             let count = conn_rx.borrow_and_update();
             if *count == 0 {
                 log::info!("no connected clients, shutting down");
-                return;
+                return Ok(());
             }
 
             log::info!("{} connected clients, waiting to shut down", *count);
@@ -45,13 +57,15 @@ where
                     1 => log::info!("1 client still connected"),
                     0 => {
                         log::info!("All clients disconnected, shutting down");
-                        return;
+                        return Ok(());
                     },
                     _ => unreachable!(),
                 }
             }
         },
     }
+
+    Ok(())
 }
 
 pub async fn run_server<S, F>(mut server: S, stop: F, listener: TcpListener, config: Arc<Config>)

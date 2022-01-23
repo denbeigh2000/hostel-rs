@@ -2,8 +2,8 @@
 [x] session sharing/persistence
 [x] configuration files
 [x] graceful shutdown (run_stream)
+[x] better error handling
 [ ] support waiting on pending containers
-[ ] better error handling
 [ ] pull policy
 [ ] max session length
 [ ] volume mounting

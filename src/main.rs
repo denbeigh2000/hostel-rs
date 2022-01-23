@@ -13,6 +13,7 @@ use hostel::config;
 use hostel::hostel::HostelServer;
 use hostel::server;
 use hostel::utils::logging;
+use thiserror::Error;
 use thrussh::server::Config as ThrusshConfig;
 use thrussh::MethodSet;
 use thrussh_keys::key::KeyPair;
@@ -47,15 +48,38 @@ struct Args {
 
 #[tokio::main]
 async fn main() {
+    if let Err(e) = real_main().await {
+        log::error!("error serving: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[derive(Debug, Error)]
+enum Error {
+    #[error("initialising logger: {0}")]
+    LogInit(#[from] log::SetLoggerError),
+    #[error("loading configuration file: {0}")]
+    ConfigLoading(#[from] config::ConfigLoadError),
+    #[error("serving requests: {0}")]
+    Serving(#[from] server::ServeError),
+    #[error("parsing server private key: {0}")]
+    ParsingPrivateKey(#[from] thrussh_keys::Error),
+    #[error("creating a redis client: {0}")]
+    BuildingRedisClient(#[from] redis::RedisError),
+    #[error("creating a docker client: {0}")]
+    BuildingDockerClient(#[from] bollard::errors::Error),
+}
+
+async fn real_main() -> Result<(), Error> {
     let args = Args::parse();
 
-    logging::init(args.log_level);
+    logging::init(args.log_level)?;
 
-    let hostel_config = config::MetaConfig::load(args.config_dir).await.unwrap();
+    let hostel_config = config::MetaConfig::load(args.config_dir).await?;
 
     let key_path = hostel_config.server_key_path();
     let key = if key_path.exists() {
-        thrussh_keys::load_secret_key(key_path, None).unwrap()
+        thrussh_keys::load_secret_key(key_path, None)?
     } else {
         let key_str = key_path.to_string_lossy();
         log::warn!("No private key found at {key_str}");
@@ -72,13 +96,15 @@ async fn main() {
         ..Default::default()
     };
 
-    let mgr = RedisConnectionManager::new(args.redis_url).unwrap();
-    let pool = Pool::builder().build(mgr).await.unwrap();
+    let mgr = RedisConnectionManager::new(args.redis_url)?;
+    let pool = Pool::builder().build(mgr).await?;
     let pool = ResourcePool::new(pool);
-    let docker = Docker::connect_with_unix_defaults().unwrap();
+    let docker = Docker::connect_with_unix_defaults()?;
     let serv = HostelServer::new(Arc::new(docker), hostel_config, Arc::new(pool));
 
     log::info!("serving on {}", &args.bind_addr);
 
-    server::serve(args.bind_addr, serv, config).await;
+    server::serve(args.bind_addr, serv, config).await?;
+
+    Ok(())
 }

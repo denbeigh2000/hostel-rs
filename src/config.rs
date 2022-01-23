@@ -1,4 +1,3 @@
-use std::convert::Infallible;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -10,10 +9,22 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 
 #[derive(Debug, Error)]
 pub enum FileParseError {
-    #[error("IO error")]
+    #[error("IO error: {0}")]
     IO(#[from] tokio::io::Error),
-    #[error("Parse error")]
+    #[error("Parse error: {0}")]
     Parse(#[from] serde_yaml::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum KeyLoadError {
+    #[error("IO error: {0}")]
+    IO(#[from] tokio::io::Error),
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigLoadError {
+    #[error("loading config file: {0}")]
+    FileParse(#[from] FileParseError),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -28,18 +39,19 @@ pub struct MetaConfig {
 }
 
 impl MetaConfig {
-    pub async fn load<P: Into<PathBuf>>(config_dir: P) -> Result<Self, Infallible> {
+    pub async fn load<P: Into<PathBuf>>(config_dir: P) -> Result<Self, ConfigLoadError> {
         let config_dir = config_dir.into();
         let config_file = config_dir.join("config.yaml");
 
-        eprintln!("{}", config_file.to_str().unwrap());
-        let mut f = File::open(&config_file).await.unwrap();
+        let mut f = File::open(&config_file)
+            .await
+            .map_err(FileParseError::from)?;
         let mut buf = Vec::new();
         if let Err(e) = f.read_to_end(&mut buf).await {
             panic!("failed to read file: {e}");
         }
 
-        let config: Config = serde_yaml::from_slice(&buf).unwrap();
+        let config: Config = serde_yaml::from_slice(&buf).map_err(FileParseError::from)?;
 
         Ok(Self { config, config_dir })
     }
@@ -70,18 +82,18 @@ impl MetaConfig {
         self.config_dir.join("users").join(user).join("authorized_keys")
     }
 
-    pub async fn user_keys(&self, user: &str) -> Result<Option<Vec<PublicKey>>, Infallible> {
+    pub async fn user_keys(&self, user: &str) -> Result<Option<Vec<PublicKey>>, KeyLoadError> {
         let key_path = self.user_key_path(user);
         if !key_path.exists() {
             log::info!("no keys for {user} at {}", key_path.to_string_lossy());
             return Ok(None);
         }
 
-        let f = File::open(key_path).await.unwrap();
+        let f = File::open(key_path).await?;
 
         let mut lines = BufReader::new(f).lines();
         let mut keys = Vec::new();
-        while let Some(line) = lines.next_line().await.unwrap() {
+        while let Some(line) = lines.next_line().await? {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
                 continue;

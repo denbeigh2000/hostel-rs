@@ -1,11 +1,11 @@
-use std::convert::Infallible;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
-use bb8_redis::bb8::{Pool, PooledConnection};
-use bb8_redis::redis::{self, FromRedisValue, RedisResult, ToRedisArgs, Value};
+use bb8_redis::bb8::{Pool, PooledConnection, RunError};
+use bb8_redis::redis::{self, FromRedisValue, RedisError, RedisResult, ToRedisArgs, Value};
 use bb8_redis::RedisConnectionManager;
 use futures::Future;
+use thiserror::Error;
 
 const RESOURCE_NEW: &str = "<new>";
 const RESOURCE_PENDING: &str = "<pending>";
@@ -112,13 +112,32 @@ pub trait Key {
     fn key(&'_ self) -> &'_ str;
 }
 
+#[derive(Debug, Error)]
+pub enum PoolError {
+    #[error("connection timeout")]
+    ConnectionTimeout,
+    #[error("redis error: {0}")]
+    Redis(#[from] RedisError),
+}
+
+impl From<RunError<RedisError>> for PoolError {
+    fn from(e: RunError<RedisError>) -> Self {
+        match e {
+            RunError::User(e) => Self::Redis(e),
+            RunError::TimedOut => Self::ConnectionTimeout,
+        }
+    }
+}
+
 impl<K, V> ResourcePool<K, V>
 where
     K: Key + Debug,
     V: AsRef<str> + From<String> + Sync + Debug,
 {
-    async fn get_conn(&self) -> Result<PooledConnection<'_, RedisConnectionManager>, Infallible> {
-        Ok(self.pool.get().await.unwrap())
+    async fn get_conn(
+        &self,
+    ) -> Result<PooledConnection<'_, RedisConnectionManager>, RunError<RedisError>> {
+        Ok(self.pool.get().await?)
     }
 
     fn count_key(&self, key: &K) -> String {
@@ -129,47 +148,39 @@ where
         format!("{}:id:{}", key.category_key(), key.key())
     }
 
-    pub async fn set_id(&self, key: &K, v: &V) -> Result<(), Infallible> {
-        let mut conn = self.get_conn().await.unwrap();
-        let mut cmd = redis::Cmd::new();
-        cmd.arg("GET").arg(self.count_key(key));
-        let n: Option<usize> = cmd.query_async(&mut *conn).await.unwrap();
-
-        log::debug!("see count: {:?}", n);
-        log::debug!("setting id: {:?} -> {:?}", key, v);
+    pub async fn set_id(&self, key: &K, v: &V) -> Result<(), PoolError> {
         let res_key = self.resource_id_key(key);
+
+        let mut conn = self.get_conn().await?;
         let mut cmd = redis::Cmd::new();
         cmd.arg("SET").arg(&res_key).arg(v.as_ref());
-        let _: () = cmd.query_async(&mut *conn).await.unwrap();
+        let _: () = cmd.query_async(&mut *conn).await?;
 
         Ok(())
     }
 
-    pub async fn join(&self, key: &K) -> Result<CountAndResource<V>, Infallible> {
+    pub async fn join(&self, key: &K) -> Result<CountAndResource<V>, PoolError> {
         let count_key = self.count_key(key);
         let res_key = self.resource_id_key(key);
 
         let data = (count_key.clone(), res_key.clone());
 
-        let conn = self.get_conn().await.unwrap();
+        let conn = self.get_conn().await?;
         let (_conn, r): (_, Option<CountAndResource<V>>) =
-            transaction(&[&count_key, &res_key], conn, data, join_txn)
-                .await
-                .unwrap();
+            transaction(&[&count_key, &res_key], conn, data, join_txn).await?;
 
         Ok(r.unwrap())
     }
 
-    pub async fn leave(&self, key: &K, resource_id: &V) -> Result<PoolState, Infallible> {
+    pub async fn leave(&self, key: &K, resource_id: &V) -> Result<PoolState, PoolError> {
         let count_key = self.count_key(key);
         let res_key = self.resource_id_key(key);
 
-        let conn = self.get_conn().await.unwrap();
+        let conn = self.get_conn().await?;
         let data = (count_key.clone(), res_key.clone(), resource_id);
 
-        let (_conn, pool_state) = transaction(&[&count_key, &res_key], conn, data, leave_txn)
-            .await
-            .unwrap();
+        let (_conn, pool_state) =
+            transaction(&[&count_key, &res_key], conn, data, leave_txn).await?;
 
         Ok(pool_state)
     }
@@ -200,14 +211,14 @@ where
             pl.arg(i);
         }
 
-        let _: () = pl.query_async(&mut *conn).await.unwrap();
+        let _: () = pl.query_async(&mut *conn).await?;
         let (c, tx) = f(conn, args.clone()).await?;
         // Re-assign to outer loop variable to avoid losing
         conn = c;
         match tx {
             Tx::Abort(v) => return Ok((conn, v)),
             Tx::Continue(pl, v) => {
-                let res: Option<()> = pl.query_async(&mut *conn).await.unwrap();
+                let res: Option<()> = pl.query_async(&mut *conn).await?;
                 log::debug!("transaction: {:?} {}/{}", res, i + 1, TRANSACTION_ATTEMPTS);
                 match res {
                     Some(_) => return Ok((conn, v)),
@@ -227,7 +238,7 @@ async fn join_txn<V: From<String> + AsRef<str> + Debug>(
     let (ck, rk) = args;
 
     cmd.arg("MGET").arg(&ck).arg(&rk);
-    let data: OptionalCountAndResource<V> = cmd.query_async(&mut *conn).await.unwrap();
+    let data: OptionalCountAndResource<V> = cmd.query_async(&mut *conn).await?;
     log::debug!("MGET #1: {:?}", &data);
 
     let (n, id, res) = match data.transpose() {
@@ -276,7 +287,7 @@ async fn leave_txn<'a, 'b, V: AsRef<str> + From<String> + Debug>(
 
     let mut cmd = redis::Cmd::new();
     cmd.arg("MGET").arg(&count_key).arg(&res_key);
-    let data: OptionalCountAndResource<V> = cmd.query_async(&mut *conn).await.unwrap();
+    let data: OptionalCountAndResource<V> = cmd.query_async(&mut *conn).await?;
     let mut pl = redis::pipe();
     pl.cmd("MULTI").ignore();
     let state = match data.transpose() {
